@@ -15,19 +15,23 @@ properties worth pinning down are:
 
 import random
 from collections import Counter
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
 
 from tieout.domain import BreakType, EventSource, Side, TradeEvent
 from tieout.ingest.simulator import (
-    BASE_PRICES,
+    MAX_BASE_PRICE,
     MAX_QUANTITY,
+    MIN_BASE_PRICE,
     MIN_QUANTITY,
     PRICE_JITTER_CENTS,
-    SYMBOLS,
+    TICKER_LENGTH,
     _Truth,
     _derive_sides,
+    _generate_symbol_universe,
+    _generate_ticker,
     _generate_true_trade,
     _inject_duplicates,
     _reorder,
@@ -118,7 +122,11 @@ def test_generated_events_respect_domain_invariants():
         assert e.timestamp.tzinfo is not None, "timestamp must be tz-aware"
         assert e.price > 0
         assert e.quantity > 0
-        assert e.symbol in SYMBOLS
+        # Symbols are randomly generated per-call now (see the
+        # _generate_symbol_universe tests below), so the only invariant to
+        # check here is the ticker *format*, not membership in a fixed list.
+        assert len(e.symbol) == TICKER_LENGTH
+        assert e.symbol.isalpha() and e.symbol.isupper()
         assert isinstance(e.side, Side)
         # Decimal, never float — float drift would be indistinguishable from a
         # real reconciliation break.
@@ -127,10 +135,14 @@ def test_generated_events_respect_domain_invariants():
 
 
 def test_prices_stay_within_jitter_band_of_base():
-    events = list(generate_events(rate_per_second=20, duration_seconds=10, break_rate=0.0, seed=4))
+    rng = random.Random(4)
+    universe = _generate_symbol_universe(rng, num_symbols=5, min_price=MIN_BASE_PRICE, max_price=MAX_BASE_PRICE)
+    symbols = list(universe)
     band = Decimal(PRICE_JITTER_CENTS) / _CENTS
-    for e in events:
-        assert abs(e.price - BASE_PRICES[e.symbol]) <= band
+    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for i in range(500):
+        truth = _generate_true_trade(rng, symbols, universe, trade_id=f"T{i}", timestamp=ts)
+        assert abs(truth.price - universe[truth.symbol]) <= band
 
 
 def test_timestamps_advance_monotonically_without_reordering():
@@ -145,15 +157,69 @@ def test_timestamps_advance_monotonically_without_reordering():
 
 
 def test_generate_true_trade_is_deterministic_for_a_given_rng():
-    from datetime import datetime, timezone
-
     ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    a = _generate_true_trade(random.Random(9), SYMBOLS, BASE_PRICES, "T1", ts)
-    b = _generate_true_trade(random.Random(9), SYMBOLS, BASE_PRICES, "T1", ts)
+    universe = {"AAPL": Decimal("150.00"), "MSFT": Decimal("310.00")}
+    symbols = list(universe)
+    a = _generate_true_trade(random.Random(9), symbols, universe, "T1", ts)
+    b = _generate_true_trade(random.Random(9), symbols, universe, "T1", ts)
     assert a == b
     assert isinstance(a, _Truth)
     assert MIN_QUANTITY <= a.quantity <= MAX_QUANTITY
     assert a.trade_id == "T1" and a.timestamp == ts
+
+
+# --------------------------------------------------------------------------
+# _generate_ticker / _generate_symbol_universe — random symbol universe
+# --------------------------------------------------------------------------
+
+
+def test_generate_ticker_is_four_uppercase_letters():
+    rng = random.Random(0)
+    for _ in range(200):
+        ticker = _generate_ticker(rng)
+        assert len(ticker) == TICKER_LENGTH
+        assert ticker.isalpha() and ticker.isupper()
+
+
+def test_generate_symbol_universe_has_requested_size_and_unique_tickers():
+    universe = _generate_symbol_universe(random.Random(1), num_symbols=25, min_price=MIN_BASE_PRICE, max_price=MAX_BASE_PRICE)
+    assert len(universe) == 25   # dict keys are already unique — this also confirms no collision was silently dropped
+
+
+def test_generate_symbol_universe_prices_stay_within_requested_band():
+    lo, hi = Decimal("20.00"), Decimal("40.00")
+    universe = _generate_symbol_universe(random.Random(2), num_symbols=50, min_price=lo, max_price=hi)
+    for price in universe.values():
+        assert lo <= price <= hi
+        assert isinstance(price, Decimal)
+
+
+def test_generate_symbol_universe_is_deterministic_for_a_given_rng():
+    a = _generate_symbol_universe(random.Random(3), num_symbols=10, min_price=MIN_BASE_PRICE, max_price=MAX_BASE_PRICE)
+    b = _generate_symbol_universe(random.Random(3), num_symbols=10, min_price=MIN_BASE_PRICE, max_price=MAX_BASE_PRICE)
+    assert a == b
+
+
+def test_generate_symbol_universe_rejects_invalid_bounds():
+    with pytest.raises(ValueError):
+        _generate_symbol_universe(random.Random(0), num_symbols=0, min_price=MIN_BASE_PRICE, max_price=MAX_BASE_PRICE)
+    with pytest.raises(ValueError):
+        _generate_symbol_universe(random.Random(0), num_symbols=5, min_price=Decimal("100.00"), max_price=Decimal("50.00"))
+
+
+def test_generate_events_uses_requested_number_of_symbols():
+    # rate * duration is large enough that missing one of 3 symbols across
+    # every draw is astronomically unlikely — a genuine signal, not flakiness.
+    events = list(
+        generate_events(rate_per_second=100, duration_seconds=20, break_rate=0.0, num_symbols=3, seed=20)
+    )
+    assert len({e.symbol for e in events}) == 3
+
+
+def test_generate_events_symbol_universes_differ_across_seeds():
+    a = list(generate_events(rate_per_second=50, duration_seconds=5, break_rate=0.0, num_symbols=5, seed=21))
+    b = list(generate_events(rate_per_second=50, duration_seconds=5, break_rate=0.0, num_symbols=5, seed=22))
+    assert {e.symbol for e in a} != {e.symbol for e in b}
 
 
 # --------------------------------------------------------------------------
@@ -162,8 +228,6 @@ def test_generate_true_trade_is_deterministic_for_a_given_rng():
 
 
 def make_truth(**overrides) -> _Truth:
-    from datetime import datetime, timezone
-
     base = dict(
         trade_id="T000000000001",
         symbol="AAPL",

@@ -3,6 +3,7 @@ from decimal import Decimal
 from typing import Iterator, NamedTuple
 import itertools
 import random
+import string
 
 from tieout.domain import BreakType, EventSource, Side, TradeEvent
 from tieout.reconciliation.rules import PRICE_TOLERANCE, QUANTITY_TOLERANCE
@@ -18,17 +19,6 @@ class _Truth(NamedTuple):
     timestamp: datetime
 
 
-BASE_PRICES = {
-    "AAPL": Decimal("150.00"),
-    "MSFT": Decimal("310.00"),
-    "GOOG": Decimal("140.00"),
-    "AMZN": Decimal("145.00"),
-    "TSLA": Decimal("240.00"),
-    "SPCX": Decimal("400.00"),
-    "META": Decimal("200.00"),
-}
-
-SYMBOLS = list(BASE_PRICES.keys())
 _SIDES = tuple(Side)
 
 _CENTS = Decimal(100)
@@ -41,6 +31,12 @@ MIN_PRICE_BREAK_CENTS = 2   # PRICE_TOLERANCE is $0.01, so 2c is the smallest re
 MAX_PRICE_BREAK_CENTS = 50
 MIN_QUANTITY_BREAK = 1      # QUANTITY_TOLERANCE is 0, so any whole share qualifies
 MAX_QUANTITY_BREAK = 25
+
+TICKER_LENGTH = 4            # standard US-equity-style ticker length
+DEFAULT_NUM_SYMBOLS = 7      # parity with the old hand-picked universe's size
+MIN_BASE_PRICE = Decimal("10.00")    # floor — keeps a fixed-cents jitter (PRICE_JITTER_CENTS)
+                                      # from dominating the price of a near-worthless symbol
+MAX_BASE_PRICE = Decimal("500.00")   # ceiling — realistic large-cap-equity band
 
 _DEFAULT_BREAK_TYPE_WEIGHTS: dict[BreakType, float] = {
     BreakType.MISSING_TRADE: 1.0,
@@ -73,6 +69,35 @@ def _generate_true_trade(
         side=rng.choice(_SIDES),
         timestamp=timestamp,
     )
+
+
+def _generate_ticker(rng: random.Random) -> str:
+    return "".join(rng.choices(string.ascii_uppercase, k=TICKER_LENGTH))
+
+
+def _generate_symbol_universe(
+    rng: random.Random,
+    num_symbols: int,
+    min_price: Decimal,
+    max_price: Decimal,
+) -> dict[str, Decimal]:
+    if num_symbols < 1:
+        raise ValueError("num_symbols must be >= 1")
+    if min_price <= 0 or max_price < min_price:
+        raise ValueError("require 0 < min_price <= max_price")
+
+    # Integer cents throughout, one exact division — same reasoning as the price
+    # jitter in _generate_true_trade: skip the float/string round-trip.
+    min_cents = int(min_price * _CENTS)
+    max_cents = int(max_price * _CENTS)
+
+    universe: dict[str, Decimal] = {}
+    while len(universe) < num_symbols:
+        ticker = _generate_ticker(rng)
+        if ticker in universe:
+            continue  # collision — retry; 26**4 possible tickers makes this rare
+        universe[ticker] = Decimal(rng.randint(min_cents, max_cents)) / _CENTS
+    return universe
 
 
 def _perturb_price(price: Decimal, rng: random.Random) -> Decimal:
@@ -177,6 +202,8 @@ def _reorder(
 
 def _emit_true_events(
     rng: random.Random,
+    symbols: list[str],
+    base_prices: dict[str, Decimal],
     rate_per_second: float,
     duration_seconds: float,
     break_rate: float,
@@ -196,8 +223,8 @@ def _emit_true_events(
 
         truth = _generate_true_trade(
             rng,
-            SYMBOLS,
-            BASE_PRICES,
+            symbols,
+            base_prices,
             trade_id=f"T{next(ids):012d}",
             timestamp=t,
         )
@@ -215,17 +242,22 @@ def generate_events(
     break_type_weights: dict[BreakType, float] | None = None,
     duplicate_rate: float = 0.0,
     reorder_window: int = 1,
+    num_symbols: int = DEFAULT_NUM_SYMBOLS,
+    min_base_price: Decimal = MIN_BASE_PRICE,
+    max_base_price: Decimal = MAX_BASE_PRICE,
     seed: int | None = None,
 ) -> Iterator[TradeEvent]:
-    # One seed in, three independent substreams out — see the module docstring
-    # for why the stages must NOT share a single Random instance.
     root = random.Random(seed)
+    symbol_rng = random.Random(root.getrandbits(64))
     emit_rng = random.Random(root.getrandbits(64))
     duplicate_rng = random.Random(root.getrandbits(64))
     reorder_rng = random.Random(root.getrandbits(64))
 
+    base_prices = _generate_symbol_universe(symbol_rng, num_symbols, min_base_price, max_base_price)
+    symbols = list(base_prices)
+
     stream = _emit_true_events(
-        emit_rng, rate_per_second, duration_seconds, break_rate, break_type_weights
+        emit_rng, symbols, base_prices, rate_per_second, duration_seconds, break_rate, break_type_weights
     )
     stream = _inject_duplicates(stream, duplicate_rng, duplicate_rate)
     yield from _reorder(stream, reorder_rng, reorder_window)
