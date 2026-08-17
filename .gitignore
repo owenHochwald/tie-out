@@ -25,6 +25,9 @@ wheels/
 *.egg
 MANIFEST
 
+# Docs
+CLAUDE.md
+docs/
 # PyInstaller
 *.manifest
 *.spec
