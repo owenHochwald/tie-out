@@ -9,6 +9,7 @@ class BreakType(Enum):
 
 @dataclass(frozen=True, slots=True)
 class Break:
+    trade_id: str
     break_type: BreakType
     # missing trade
     missing_side: EventSource | None = None
@@ -16,5 +17,5 @@ class Break:
 
     # field mismatch
     book_trade: TradeEvent | None = None
-    market_trade: TradeEvent | None = None 
+    market_trade: TradeEvent | None = None
 
