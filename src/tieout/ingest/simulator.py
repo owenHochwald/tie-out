@@ -1,22 +1,3 @@
-"""Synthetic event simulator — see CLAUDE.md "The synthetic event simulator".
-
-Conceptual model: one ground truth, two possibly-divergent derived recordings.
-We generate one true trade, then derive what the book side and the market side
-each *recorded* — which may diverge because of an injected break.
-
-Pipeline (each stage is a lazy generator consuming the previous one, so nothing
-is ever materialized as a full list):
-
-    _emit_true_events  →  _inject_duplicates  →  _reorder  →  caller
-
-Reproducibility invariant: every stage draws randomness from the SAME
-`random.Random(seed)` instance, threaded through as a parameter. Never call the
-module-level `random.*` functions here, and never create per-stage Random()
-instances — either silently breaks `seed`'s whole purpose (rerunning the exact
-failing sequence). For the same reason, nothing stateful that affects output
-(counters, clock anchors) may live at module scope: it must be created per call.
-"""
-
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Iterator, NamedTuple
@@ -28,12 +9,6 @@ from tieout.reconciliation.rules import PRICE_TOLERANCE, QUANTITY_TOLERANCE
 
 
 class _Truth(NamedTuple):
-    """The ground-truth trade, before either side records it.
-
-    Deliberately NOT a TradeEvent: a TradeEvent has a `source` (BOOK/MARKET),
-    and the truth is neither — it's what actually happened. `_derive_sides` is
-    where real TradeEvents (each with a real source) get constructed from this.
-    """
 
     trade_id: str
     symbol: str
@@ -59,16 +34,9 @@ _SIDES = tuple(Side)
 _CENTS = Decimal(100)
 
 PRICE_JITTER_CENTS = 50
-# Trades print within ±$0.50 of the symbol's base price. Uniform rather than
-# gaussian: easier to reason about the bounds when asserting in tests.
-
 MIN_QUANTITY = 1
 MAX_QUANTITY = 1000
 
-# Perturbation magnitudes for injected breaks. Each must exceed the matching
-# tolerance in reconciliation/rules.py — if a perturbation landed *within*
-# tolerance, classify() would call the trade clean and the observed break rate
-# would silently undershoot the configured break_rate.
 MIN_PRICE_BREAK_CENTS = 2   # PRICE_TOLERANCE is $0.01, so 2c is the smallest real break
 MAX_PRICE_BREAK_CENTS = 50
 MIN_QUANTITY_BREAK = 1      # QUANTITY_TOLERANCE is 0, so any whole share qualifies
@@ -88,12 +56,6 @@ def _generate_true_trade(
     trade_id: str,
     timestamp: datetime,
 ) -> _Truth:
-    """Generate the content of one true trade: symbol, quantity, price, side.
-
-    `trade_id` and `timestamp` are supplied by the caller (_emit_true_events
-    owns the counter and the Poisson clock) — this function only invents the
-    trade's *content*.
-    """
     symbol = rng.choice(symbols)
 
     # Integer cents throughout, then one exact division. Never str() or float:
@@ -142,16 +104,6 @@ def _derive_sides(
     break_rate: float,
     break_type_weights: dict[BreakType, float] | None = None,
 ) -> tuple[TradeEvent | None, TradeEvent | None]:
-    """Derive (book_event, market_event) from one ground truth.
-
-    Two separate dice rolls:
-      1. `rng.random() < break_rate` — does a break happen at all?
-      2. only if so — which BreakType, by relative weight?
-
-    The market side is the one perturbed, by convention. Which side "got it
-    wrong" is arbitrary from the reconciliation engine's point of view: it
-    compares the two and reports a disagreement without attributing blame.
-    """
     fields = truth._asdict()
     book = TradeEvent(**fields, source=EventSource.BOOK)
     market = TradeEvent(**fields, source=EventSource.MARKET)
@@ -207,29 +159,6 @@ def _reorder(
     rng: random.Random,
     window: int,
 ) -> Iterator[TradeEvent]:
-    """Shuffle within a sliding buffer of `window` events.
-
-    O(window) memory, O(1) amortized per event — the stream is never fully
-    materialized. `window <= 1` is exact passthrough (no reordering), matching
-    the documented default of `reorder_window=1`.
-
-    What this guarantees, precisely (worth being exact about, since the obvious
-    assumption is wrong):
-
-      - the output is an exact permutation of the input — nothing lost, nothing
-        invented;
-      - an event can be emitted at most `window - 1` positions EARLIER than it
-        arrived (it can't jump ahead of a buffer it hasn't entered);
-      - lateness is NOT hard-bounded. Each round pops a random buffer index, so
-        an event survives a round with probability (window-1)/window — lateness
-        is geometrically distributed, mean ≈ window, with a long tail. At
-        window=50, displacements past 150 show up routinely.
-
-    That tail is realistic for simulating out-of-order arrival (most events
-    near-ordered, occasional stragglers), but it means a test asserting a hard
-    displacement bound will fail intermittently. Assert on the permutation
-    property instead, or on displacement percentiles.
-    """
     if window <= 1:
         yield from events
         return
@@ -253,20 +182,6 @@ def _emit_true_events(
     break_rate: float,
     break_type_weights: dict[BreakType, float] | None = None,
 ) -> Iterator[TradeEvent]:
-    """Poisson-paced source stage: generate truths, derive sides, flatten.
-
-    Owns the trade_id counter and the clock. Event count is a BYPRODUCT of
-    duration × rate, not an input — a rate is an average, so real counts vary
-    run to run. That variance is correct, not a bug.
-
-    Inter-arrival gaps are exponential (a Poisson arrival process) rather than a
-    fixed 1/rate interval: real trade prints are bursty and clustered, and
-    uniform spacing wouldn't stress backlog or reordering realistically.
-
-    No sleeping here: this runs as fast as Python allows and produces
-    well-timestamped objects. Pacing emission against wall-clock time belongs in
-    loadtest/, wrapping this generator.
-    """
     ids = itertools.count(start=1)
     # Anchored ONCE, not read per-event: wall-clock reads would make timestamps
     # differ between runs even with an identical seed.
@@ -302,10 +217,15 @@ def generate_events(
     reorder_window: int = 1,
     seed: int | None = None,
 ) -> Iterator[TradeEvent]:
-    rng = random.Random(seed)
+    # One seed in, three independent substreams out — see the module docstring
+    # for why the stages must NOT share a single Random instance.
+    root = random.Random(seed)
+    emit_rng = random.Random(root.getrandbits(64))
+    duplicate_rng = random.Random(root.getrandbits(64))
+    reorder_rng = random.Random(root.getrandbits(64))
 
     stream = _emit_true_events(
-        rng, rate_per_second, duration_seconds, break_rate, break_type_weights
+        emit_rng, rate_per_second, duration_seconds, break_rate, break_type_weights
     )
-    stream = _inject_duplicates(stream, rng, duplicate_rate)
-    yield from _reorder(stream, rng, reorder_window)
+    stream = _inject_duplicates(stream, duplicate_rng, duplicate_rate)
+    yield from _reorder(stream, reorder_rng, reorder_window)
