@@ -4,15 +4,15 @@ from tieout.domain.events import EventSource, TradeEvent
 
 class BreakType(Enum):
     MISSING_TRADE = auto()
-    QUANTITIY_MISMATCH = auto()
+    QUANTITY_MISMATCH = auto()
     PRICE_MISMATCH = auto()
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class Break:
     break_type: BreakType
     # missing trade
     missing_side: EventSource | None = None
-    present_even: TradeEvent | None = None
+    present_event: TradeEvent | None = None
 
     # field mismatch
     book_trade: TradeEvent | None = None
