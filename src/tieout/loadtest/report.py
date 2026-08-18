@@ -5,7 +5,10 @@ latency (generation -> XACK). Everything else here is derived from those two.
 
 from dataclasses import dataclass, field
 
+import pandas as pd
+
 from tieout.domain import Break
+from tieout.reporting.report import break_report, position_report
 from tieout.rollup.aggregator import RollupAggregator
 
 
@@ -31,6 +34,11 @@ class RateResult:
     drained: bool                             # did backlog_samples return to 0 within drain_timeout_s?
     drain_elapsed_s: float | None             # time to drain, if it did
     final_backlog: int
+    push_capped: bool                         # producer itself couldn't sustain `rate` (PUSH_OVERRUN_FACTOR)
+                                               # — a different fact than `drained`; see harness.py.
+    rollup: RollupAggregator                  # this trial's Processor.rollup — what actually got processed,
+                                               # not a full reconciled book (sweep_stale() is never called here)
+    break_log: list[Break]                    # this trial's Processor.break_log
 
     def latency_percentiles(self) -> dict[str, float]:
         values = sorted(self.latencies_s)
@@ -44,13 +52,24 @@ class RateResult:
     def peak_backlog(self) -> int:
         return max((backlog for _, backlog in self.backlog_samples), default=0)
 
+    def position_report(self) -> pd.DataFrame:
+        """This trial's rollup, via reporting/report.py — no separate data path."""
+        return position_report(self.rollup)
+
+    def break_report(self) -> pd.DataFrame:
+        """This trial's breaks, via reporting/report.py — no separate data path."""
+        return break_report(self.break_log)
+
     def _metrics_str(self) -> str:
         p = self.latency_percentiles()
         status = "OK, drained" if self.drained else "BOTTLENECK, did not drain"
-        return (
+        line = (
             f"{status:<26}  peak backlog={self.peak_backlog():<6}  final backlog={self.final_backlog:<6}  "
             f"latency p50={p['p50']:.3f}s p95={p['p95']:.3f}s p99={p['p99']:.3f}s max={p['max']:.3f}s"
         )
+        if self.push_capped:
+            line += "  [producer couldn't sustain this rate — see log]"
+        return line
 
     def summary_line(self) -> str:
         return f"{self.rate:>8g} evt/s  {self._metrics_str()}"
