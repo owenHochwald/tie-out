@@ -36,12 +36,17 @@ def test_clean_pair_updates_rollup_and_produces_no_break():
     assert p.rollup.get("AAPL").total_quantity == Decimal(100)
 
 
-def test_mismatch_produces_break_and_logs_it():
+def test_mismatch_produces_break_and_logs_it(caplog):
     p = Processor()
     p.process(make("T1", EventSource.BOOK, quantity=Decimal(100)), arrived_at=TS)
-    result = p.process(make("T1", EventSource.MARKET, quantity=Decimal(90)), arrived_at=TS)
+    with caplog.at_level("INFO", logger="tieout.pipeline"):
+        result = p.process(make("T1", EventSource.MARKET, quantity=Decimal(90)), arrived_at=TS)
     assert result.break_type is BreakType.QUANTITY_MISMATCH
     assert p.break_log == [result]
+    # CLAUDE.md's audit trail: one line per break detected.
+    assert "break detected" in caplog.text
+    assert "QUANTITY_MISMATCH" in caplog.text
+    assert "T1" in caplog.text
 
 
 def test_exact_duplicate_is_ignored_not_treated_as_counterpart():
@@ -80,13 +85,16 @@ def test_legitimate_counterpart_is_not_swallowed_by_seen():
     assert len(p.store) == 0
 
 
-def test_sweep_stale_appends_to_break_log():
+def test_sweep_stale_appends_to_break_log(caplog):
     p = Processor()
     p.process(make("T1", EventSource.BOOK), arrived_at=TS)
-    breaks = p.sweep_stale(now=TS + timedelta(seconds=301), timeout_s=300)
+    with caplog.at_level("INFO", logger="tieout.pipeline"):
+        breaks = p.sweep_stale(now=TS + timedelta(seconds=301), timeout_s=300)
     assert len(breaks) == 1
     assert breaks[0].break_type is BreakType.MISSING_TRADE
     assert p.break_log == breaks
+    assert "break detected" in caplog.text
+    assert "MISSING_TRADE" in caplog.text
 
 
 def test_full_chaos_config_stream_does_not_crash_and_stays_consistent():

@@ -129,7 +129,7 @@ async def test_worker_loop_bad_message_stays_unacked_for_reclaim(client, monkeyp
     assert pending["pending"] == 1  # process() raised -> xack was skipped
 
 
-async def test_reclaim_loop_picks_up_message_left_unacked_by_dead_worker(client, monkeypatch):
+async def test_reclaim_loop_picks_up_message_left_unacked_by_dead_worker(client, monkeypatch, caplog):
     import tieout.queue.reclaim as reclaim_module
 
     await ensure_group(client)
@@ -146,17 +146,20 @@ async def test_reclaim_loop_picks_up_message_left_unacked_by_dead_worker(client,
     await asyncio.sleep(0.05)  # exceed the (patched) idle threshold
 
     processor = Processor()
-    task = asyncio.create_task(
-        reclaim_module.reclaim_loop(client, "reclaimer", processor, interval_s=0.01)
-    )
-    try:
-        await _run_until(lambda: ("T1", EventSource.BOOK) in processor.seen)
-    finally:
-        await _cancel(task)
+    with caplog.at_level("INFO", logger="tieout.queue.reclaim"):
+        task = asyncio.create_task(
+            reclaim_module.reclaim_loop(client, "reclaimer", processor, interval_s=0.01)
+        )
+        try:
+            await _run_until(lambda: ("T1", EventSource.BOOK) in processor.seen)
+        finally:
+            await _cancel(task)
 
     assert processor.rollup.all_rollups()["AAPL"].total_quantity == Decimal(100)
     pending = await client.xpending(STREAM_NAME, GROUP_NAME)
     assert pending["pending"] == 0  # reclaimed message got acked
+    # CLAUDE.md's audit trail: one line per stale-sweep reclaim.
+    assert "reclaimed and reprocessed" in caplog.text
 
 
 async def test_reclaimed_message_already_applied_is_a_no_op(client, monkeypatch):
