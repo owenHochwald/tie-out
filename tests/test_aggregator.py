@@ -118,6 +118,29 @@ def test_order_independence_random_shuffles_converge_to_identical_state():
     assert a_state == b_state
 
 
+def test_order_independence_at_scale():
+    """Same property as test_order_independence_random_shuffles_converge_to_identical_state,
+    but at a scale worth citing: 250K trades, two independent random shuffles."""
+    trades = [
+        make(f"T{i}", random.choice(["AAPL", "MSFT", "GOOG", "AMZN", "TSLA"]), 10 + i % 500, "100.00")
+        for i in range(250_000)
+    ]
+    rng = random.Random(1)
+    order_a, order_b = trades[:], trades[:]
+    rng.shuffle(order_a)
+    rng.shuffle(order_b)
+
+    agg_a, agg_b = RollupAggregator(), RollupAggregator()
+    for t in order_a:
+        agg_a.apply(t)
+    for t in order_b:
+        agg_b.apply(t)
+
+    a_state = {s: (r.total_quantity, r.total_notional) for s, r in agg_a.all_rollups().items()}
+    b_state = {s: (r.total_quantity, r.total_notional) for s, r in agg_b.all_rollups().items()}
+    assert a_state == b_state
+
+
 def test_order_independence_with_duplicates_interspersed():
     """Same property, but with each trade appearing 1-3 times at random
     positions — proving duplicate-safety AND order-independence together, as
