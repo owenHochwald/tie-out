@@ -17,10 +17,16 @@ async def worker_loop(
     processor: Processor,
     running: Callable[[], bool],
     block_ms: int = 5_000,
+    on_ack: Callable[[str], None] | None = None,
 ) -> None:
     """`block_ms`: server-side wait via XREADGROUP's BLOCK, not our own
     asyncio.sleep — avoids busy-polling while still rechecking `running()`
     on every timeout, so the loop shuts down within one block interval.
+
+    `on_ack`: optional hook called with the entry_id right after a
+    successful XACK. Not needed for normal operation — added for
+    loadtest/harness.py, which has no other way to observe per-message ack
+    timing without duplicating this loop.
     """
     while running():
         response = await client.xreadgroup(
@@ -44,3 +50,5 @@ async def worker_loop(
                     )
                     continue
                 await client.xack(STREAM_NAME, GROUP_NAME, entry_id)
+                if on_ack is not None:
+                    on_ack(entry_id)
