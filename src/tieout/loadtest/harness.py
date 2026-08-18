@@ -11,20 +11,31 @@ scenario is already covered directly in test_queue.py.
 """
 
 import asyncio
+import logging
 import time
 from collections.abc import Callable
 
 import redis.asyncio as redis
 
 from tieout.ingest.simulator import generate_events
-from tieout.loadtest.report import LoadTestReport, RateResult
+from tieout.loadtest.report import LoadTestReport, RateResult, WorkerSweepReport
 from tieout.pipeline import Processor
 from tieout.queue.client import STREAM_NAME, make_client
 from tieout.queue.setup import ensure_group
 from tieout.queue.producer import push_event
 from tieout.queue.worker import worker_loop
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_NUM_WORKERS = 4
+# Hard wall-clock cap on the push phase, as a multiple of duration_s. Once a
+# requested rate exceeds what one unpipelined connection can actually drive,
+# duration_s stops bounding real time — the push loop would otherwise just
+# keep awaiting XADD round-trips until the (possibly huge) generated event
+# count is exhausted, regardless of how small duration_s/drain_timeout_s
+# are. This is what keeps total runtime bounded in that case; 3x is
+# generous enough that a merely-slow-but-keeping-up run isn't cut off.
+PUSH_OVERRUN_FACTOR = 3.0
 # XLEN sampling cadence: fine enough to see a trend within a duration_s of
 # tens of seconds, coarse enough not to make the sampler itself a meaningful
 # share of Redis traffic.
@@ -84,13 +95,19 @@ async def _generate_at_rate(
     duplicate_rate: float,
     reorder_window: int,
     seed: int | None,
-) -> None:
+) -> bool:
     """Paces real XADDs against wall-clock time, using the inter-arrival
     gaps generate_events() already computed — the simulator itself never
     sleeps (CLAUDE.md/producer.py), pacing is this module's job.
+
+    Returns True if the producer itself couldn't sustain `rate` and had to
+    stop early (see PUSH_OVERRUN_FACTOR) — distinct from the queue/worker
+    system falling behind, which `drained` in the caller reports separately.
     """
     start = time.monotonic()
     first_ts = None
+    push_deadline = start + duration_s * PUSH_OVERRUN_FACTOR
+    pushed = 0
     for event in generate_events(
         rate_per_second=rate,
         duration_seconds=duration_s,
@@ -101,12 +118,23 @@ async def _generate_at_rate(
     ):
         if first_ts is None:
             first_ts = event.timestamp
+        now = time.monotonic()
+        if now > push_deadline:
+            logger.warning(
+                "producer could not sustain %.0f evt/s: stopped after %d events / %.1fs "
+                "(requested duration %.1fs) — this is the producer's own ceiling, not "
+                "necessarily the queue/worker system's",
+                rate, pushed, now - start, duration_s,
+            )
+            return True
         target = start + (event.timestamp - first_ts).total_seconds()
-        delay = target - time.monotonic()
+        delay = target - now
         if delay > 0:
             await asyncio.sleep(delay)
         entry_id = await push_event(client, event)
         pushed_at[entry_id] = time.monotonic()
+        pushed += 1
+    return False
 
 
 async def _run_single_rate(
@@ -148,7 +176,7 @@ async def _run_single_rate(
         _sample_xlen(client, xlen_samples, backlog_samples, latencies, start, sample_interval_s, stop_sampling)
     )
 
-    await _generate_at_rate(
+    push_capped = await _generate_at_rate(
         client, rate, duration_s, pushed_at,
         break_rate=break_rate, duplicate_rate=duplicate_rate,
         reorder_window=reorder_window, seed=seed,
@@ -176,12 +204,16 @@ async def _run_single_rate(
 
     return RateResult(
         rate=rate,
+        num_workers=num_workers,
         xlen_samples=xlen_samples,
         backlog_samples=backlog_samples,
         latencies_s=latencies,
         drained=drained,
         drain_elapsed_s=drain_elapsed,
         final_backlog=final_backlog,
+        push_capped=push_capped,
+        rollup=processor.rollup,
+        break_log=processor.break_log,
     )
 
 
@@ -212,6 +244,36 @@ async def run_load_test(
             if not result.drained:
                 report.bottleneck_rate = rate
                 break
+    finally:
+        await client.aclose()
+    return report
+
+
+async def sweep_worker_counts(
+    rate: float,
+    worker_counts: list[int],
+    duration_s: float,
+    sample_interval_s: float = DEFAULT_SAMPLE_INTERVAL_S,
+    drain_timeout_s: float = DEFAULT_DRAIN_TIMEOUT_S,
+    break_rate: float = DEFAULT_BREAK_RATE,
+    duplicate_rate: float = DEFAULT_DUPLICATE_RATE,
+    reorder_window: int = DEFAULT_REORDER_WINDOW,
+    seed: int | None = None,
+) -> WorkerSweepReport:
+    """Fixed rate, worker count varied — demonstrates horizontal scaling
+    (CLAUDE.md non-goals: demonstrate, don't auto-provision). More consumer
+    group workers should drain the same backlog faster; this measures
+    whether that's actually true, not just plausible.
+    """
+    client = make_client()
+    report = WorkerSweepReport(rate=rate)
+    try:
+        for num_workers in worker_counts:
+            result = await _run_single_rate(
+                client, rate, duration_s, num_workers, sample_interval_s, drain_timeout_s,
+                break_rate, duplicate_rate, reorder_window, seed,
+            )
+            report.results.append(result)
     finally:
         await client.aclose()
     return report

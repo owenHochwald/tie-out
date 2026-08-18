@@ -42,3 +42,7 @@ async def reclaim_loop(
                 )
                 continue
             await client.xack(STREAM_NAME, GROUP_NAME, entry_id)
+            # One line per stale-sweep reclaim (CLAUDE.md's Reporting section) —
+            # this message sat unacked past IDLE_THRESHOLD_MS, was redelivered
+            # to a live consumer, and just completed successfully.
+            logger.info("%s: reclaimed and reprocessed %s (idle >= %dms)", consumer_name, entry_id, IDLE_THRESHOLD_MS)

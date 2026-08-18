@@ -5,6 +5,9 @@ latency (generation -> XACK). Everything else here is derived from those two.
 
 from dataclasses import dataclass, field
 
+from tieout.domain import Break
+from tieout.rollup.aggregator import RollupAggregator
+
 
 def _percentile(sorted_values: list[float], pct: float) -> float:
     if not sorted_values:
@@ -16,6 +19,7 @@ def _percentile(sorted_values: list[float], pct: float) -> float:
 @dataclass
 class RateResult:
     rate: float
+    num_workers: int
     xlen_samples: list[tuple[float, int]]     # (elapsed_seconds, raw XLEN) — total stream size over time.
                                                # Redis never shrinks this on XACK (only XTRIM/XDEL do), so
                                                # raw XLEN alone can never signal "caught up" — it's kept here
@@ -40,18 +44,22 @@ class RateResult:
     def peak_backlog(self) -> int:
         return max((backlog for _, backlog in self.backlog_samples), default=0)
 
-    def summary_line(self) -> str:
+    def _metrics_str(self) -> str:
         p = self.latency_percentiles()
         status = "OK, drained" if self.drained else "BOTTLENECK, did not drain"
         return (
-            f"{self.rate:>8g} evt/s  {status:<26}  "
-            f"peak backlog={self.peak_backlog():<6}  final backlog={self.final_backlog:<6}  "
+            f"{status:<26}  peak backlog={self.peak_backlog():<6}  final backlog={self.final_backlog:<6}  "
             f"latency p50={p['p50']:.3f}s p95={p['p95']:.3f}s p99={p['p99']:.3f}s max={p['max']:.3f}s"
         )
+
+    def summary_line(self) -> str:
+        return f"{self.rate:>8g} evt/s  {self._metrics_str()}"
 
 
 @dataclass
 class LoadTestReport:
+    """One or more rates, tested ascending, stopping at the first bottleneck."""
+
     results: list[RateResult] = field(default_factory=list)
     bottleneck_rate: float | None = None  # None means every tested rate kept up
 
@@ -68,3 +76,21 @@ class LoadTestReport:
                 "at every rate tried. Re-run with higher rates to find the actual ceiling."
             )
         return "\n".join(lines)
+
+
+@dataclass
+class WorkerSweepReport:
+    """Fixed rate, worker count varied — the horizontal-scaling demonstration
+    CLAUDE.md names as the natural extension once the rate sweep works. Runs
+    every requested worker count (unlike LoadTestReport, it does not stop
+    early): an intentionally saturated low-worker-count run is exactly the
+    interesting data point here, not a stopping condition.
+    """
+
+    rate: float
+    results: list[RateResult] = field(default_factory=list)  # one per worker count, as requested
+
+    def summary(self) -> str:
+        header = f"Worker-count sweep @ {self.rate:g} events/sec:"
+        lines = [f"{r.num_workers:>3} workers  {r._metrics_str()}" for r in self.results]
+        return "\n".join([header, *lines])
