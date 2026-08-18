@@ -26,6 +26,7 @@ wheels/
 MANIFEST
 
 # Docs
+loadtest-output/
 CLAUDE.md
 docs/
 # PyInstaller
